@@ -46,6 +46,8 @@ if(POLICY CMP0042)
   cmake_policy(SET CMP0042 NEW)
 endif()
 
+include(${CMAKE_CURRENT_SOURCE_DIR}/arangodb.cmake)
+
 if(NOT CMAKE_BUILD_TYPE)
   if(EXISTS "${CMAKE_SOURCE_DIR}/.git")
     set(default_build_type "Debug")
@@ -110,7 +112,11 @@ else()
     if(WITH_JEMALLOC)
       find_package(JeMalloc REQUIRED)
       add_definitions(-DROCKSDB_JEMALLOC -DJEMALLOC_NO_DEMANGLE)
-      list(APPEND THIRDPARTY_LIBS JeMalloc::JeMalloc)
+      # intentional deviation from RocksDB CMake
+      # list(APPEND THIRDPARTY_LIBS JeMalloc::JeMalloc)
+      include_directories(${JEMALLOC_INCLUDE_DIR})
+      list(APPEND THIRDPARTY_LIBS ${JEMALLOC_LIBRARIES})
+      # intentional deviation end
     endif()
   endif()
 
@@ -147,7 +153,11 @@ else()
       find_package(Snappy REQUIRED)
     endif()
     add_definitions(-DSNAPPY)
-    list(APPEND THIRDPARTY_LIBS Snappy::snappy)
+    # intentional deviation from RocksDB CMake
+    # list(APPEND THIRDPARTY_LIBS Snappy::snappy)
+    include_directories(${SNAPPY_INCLUDE_DIR})
+    list(APPEND THIRDPARTY_LIBS ${SNAPPY_LIBRARIES})
+    # intentional deviation end
   endif()
 
   if(WITH_ZLIB)
@@ -1075,6 +1085,11 @@ option(WITH_BENCHMARK_TOOLS "build with benchmarks" ON)
 option(WITH_CORE_TOOLS "build with ldb and sst_dump" ON)
 option(WITH_TOOLS "build with tools" ON)
 
+# intentional deviation from RocksDB CMake
+include_directories(SYSTEM ${PROJECT_SOURCE_DIR}/third-party/gtest-1.8.1/fused-src)
+add_subdirectory(third-party/gtest-1.8.1/fused-src/gtest)
+# intentional deviation end
+
 if(WITH_TESTS OR WITH_BENCHMARK_TOOLS OR WITH_TOOLS OR WITH_JNI OR JNI)
   include_directories(SYSTEM ${PROJECT_SOURCE_DIR}/third-party/gtest-1.8.1/fused-src)
 endif()
@@ -1156,7 +1171,9 @@ endif()
 option(WITH_ALL_TESTS "Build all test, rather than a small subset" ON)
 
 if(WITH_TESTS OR WITH_BENCHMARK_TOOLS)
-  add_subdirectory(third-party/gtest-1.8.1/fused-src/gtest)
+  # intentional deviation from RocksDB CMake (it's already added unconditionally above)
+  #add_subdirectory(third-party/gtest-1.8.1/fused-src/gtest)
+  # intentional deviation end
   add_library(testharness STATIC
   test_util/mock_time_env.cc
   test_util/testharness.cc)
