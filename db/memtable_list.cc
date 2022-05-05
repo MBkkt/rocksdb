@@ -505,7 +505,6 @@ Status MemTableList::TryInstallMemtableFlushResults(
         min_wal_number_to_keep =
             PrecomputeMinLogNumberToKeepNon2PC(vset, *cfd, edit_list);
       }
-      edit_list.back()->SetMinLogNumberToKeep(min_wal_number_to_keep);
 
       VersionEdit wal_deletion;
       wal_deletion.SetMinLogNumberToKeep(min_wal_number_to_keep);
@@ -805,7 +804,6 @@ Status InstallMemtableAtomicFlushResults(
     min_wal_number_to_keep =
         PrecomputeMinLogNumberToKeepNon2PC(vset, cfds, edit_lists);
   }
-  edit_lists.back().back()->SetMinLogNumberToKeep(min_wal_number_to_keep);
 
   VersionEdit wal_deletion;
   wal_deletion.SetMinLogNumberToKeep(min_wal_number_to_keep);
