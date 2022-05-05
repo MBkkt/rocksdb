@@ -245,8 +245,8 @@ struct FileMetaData {
 
   // REQUIRED: Keys must be given to the function in sorted order (it expects
   // the last key to be the largest).
-  void UpdateBoundaries(const Slice& key, const Slice& value,
-                        SequenceNumber seqno, ValueType value_type);
+  Status UpdateBoundaries(const Slice& key, const Slice& value,
+                          SequenceNumber seqno, ValueType value_type);
 
   // Unlike UpdateBoundaries, ranges do not need to be presented in any
   // particular order.
@@ -396,7 +396,6 @@ class VersionEdit {
   const DeletedFiles& GetDeletedFiles() const { return deleted_files_; }
 
   // Add the specified table file at the specified level.
-  // REQUIRES: This version has not been saved (see VersionSet::SaveTo)
   // REQUIRES: "smallest" and "largest" are smallest and largest keys in file
   // REQUIRES: "oldest_blob_file_number" is the number of the oldest blob file
   // referred to by this file if any, kInvalidBlobFileNumber otherwise.

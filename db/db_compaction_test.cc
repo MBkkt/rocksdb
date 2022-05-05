@@ -369,89 +369,6 @@ TEST_P(DBCompactionTestWithParam, CompactionDeletionTrigger) {
 }
 #endif  // !defined(ROCKSDB_VALGRIND_RUN) || defined(ROCKSDB_FULL_VALGRIND_RUN)
 
-TEST_P(DBCompactionTestWithParam, CompactionsPreserveDeletes) {
-  //  For each options type we test following
-  //  - Enable preserve_deletes
-  //  - write bunch of keys and deletes
-  //  - Set start_seqnum to the beginning; compact; check that keys are present
-  //  - rewind start_seqnum way forward; compact; check that keys are gone
-
-  for (int tid = 0; tid < 3; ++tid) {
-    Options options = DeletionTriggerOptions(CurrentOptions());
-    options.max_subcompactions = max_subcompactions_;
-    options.preserve_deletes=true;
-    options.num_levels = 2;
-
-    if (tid == 1) {
-      options.skip_stats_update_on_db_open = true;
-    } else if (tid == 2) {
-      // third pass with universal compaction
-      options.compaction_style = kCompactionStyleUniversal;
-    }
-
-    DestroyAndReopen(options);
-    Random rnd(301);
-    // highlight the default; all deletes should be preserved
-    SetPreserveDeletesSequenceNumber(0);
-
-    const int kTestSize = kCDTKeysPerBuffer;
-    std::vector<std::string> values;
-    for (int k = 0; k < kTestSize; ++k) {
-      values.push_back(rnd.RandomString(kCDTValueSize));
-      ASSERT_OK(Put(Key(k), values[k]));
-    }
-
-    for (int k = 0; k < kTestSize; ++k) {
-      ASSERT_OK(Delete(Key(k)));
-    }
-    // to ensure we tackle all tombstones
-    CompactRangeOptions cro;
-    cro.change_level = true;
-    cro.target_level = 2;
-    cro.bottommost_level_compaction =
-        BottommostLevelCompaction::kForceOptimized;
-
-    ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
-    ASSERT_TRUE(
-        dbfull()->CompactRange(cro, nullptr, nullptr).IsInvalidArgument());
-
-    // check that normal user iterator doesn't see anything
-    Iterator* db_iter = dbfull()->NewIterator(ReadOptions());
-    int i = 0;
-    for (db_iter->SeekToFirst(); db_iter->Valid(); db_iter->Next()) {
-      i++;
-    }
-    ASSERT_OK(db_iter->status());
-    ASSERT_EQ(i, 0);
-    delete db_iter;
-
-    // check that iterator that sees internal keys sees tombstones
-    ReadOptions ro;
-    ro.iter_start_seqnum=1;
-    db_iter = dbfull()->NewIterator(ro);
-    ASSERT_OK(db_iter->status());
-    i = 0;
-    for (db_iter->SeekToFirst(); db_iter->Valid(); db_iter->Next()) {
-      i++;
-    }
-    ASSERT_EQ(i, 4);
-    delete db_iter;
-
-    // now all deletes should be gone
-    SetPreserveDeletesSequenceNumber(100000000);
-    ASSERT_NOK(dbfull()->CompactRange(cro, nullptr, nullptr));
-
-    db_iter = dbfull()->NewIterator(ro);
-    ASSERT_TRUE(db_iter->status().IsInvalidArgument());
-    i = 0;
-    for (db_iter->SeekToFirst(); db_iter->Valid(); db_iter->Next()) {
-      i++;
-    }
-    ASSERT_EQ(i, 0);
-    delete db_iter;
-  }
-}
-
 TEST_F(DBCompactionTest, SkipStatsUpdateTest) {
   // This test verify UpdateAccumulatedStats is not on
   // if options.skip_stats_update_on_db_open = true
@@ -501,7 +418,6 @@ TEST_F(DBCompactionTest, SkipStatsUpdateTest) {
 TEST_F(DBCompactionTest, TestTableReaderForCompaction) {
   Options options = CurrentOptions();
   options.env = env_;
-  options.new_table_reader_for_compaction_inputs = true;
   options.max_open_files = 20;
   options.level0_file_num_compaction_trigger = 3;
   // Avoid many shards with small max_open_files, where as little as
@@ -1435,6 +1351,74 @@ TEST_P(DBCompactionTestWithParam, TrivialMoveTargetLevel) {
   }
   for (int32_t i = 600; i <= 700; i++) {
     ASSERT_EQ(Get(Key(i)), values[i]);
+  }
+}
+
+TEST_P(DBCompactionTestWithParam, PartialOverlappingL0) {
+  class SubCompactionEventListener : public EventListener {
+   public:
+    void OnSubcompactionCompleted(const SubcompactionJobInfo&) override {
+      sub_compaction_finished_++;
+    }
+    std::atomic<int> sub_compaction_finished_{0};
+  };
+
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.write_buffer_size = 10 * 1024 * 1024;
+  options.max_subcompactions = max_subcompactions_;
+  SubCompactionEventListener* listener = new SubCompactionEventListener();
+  options.listeners.emplace_back(listener);
+
+  DestroyAndReopen(options);
+
+  // For subcompactino to trigger, output level needs to be non-empty.
+  ASSERT_OK(Put("key", ""));
+  ASSERT_OK(Put("kez", ""));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("key", ""));
+  ASSERT_OK(Put("kez", ""));
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+
+  // Ranges that are only briefly overlapping so that they won't be trivially
+  // moved but subcompaction ranges would only contain a subset of files.
+  std::vector<std::pair<int32_t, int32_t>> ranges = {
+      {100, 199}, {198, 399}, {397, 600}, {598, 800}, {799, 900}, {895, 999},
+  };
+  int32_t value_size = 10 * 1024;  // 10 KB
+
+  Random rnd(301);
+  std::map<int32_t, std::string> values;
+  for (size_t i = 0; i < ranges.size(); i++) {
+    for (int32_t j = ranges[i].first; j <= ranges[i].second; j++) {
+      values[j] = rnd.RandomString(value_size);
+      ASSERT_OK(Put(Key(j), values[j]));
+    }
+    ASSERT_OK(Flush());
+  }
+
+  int32_t level0_files = NumTableFilesAtLevel(0, 0);
+  ASSERT_EQ(level0_files, ranges.size());    // Multiple files in L0
+  ASSERT_EQ(NumTableFilesAtLevel(1, 0), 1);  // One file in L1
+
+  listener->sub_compaction_finished_ = 0;
+  ASSERT_OK(db_->EnableAutoCompaction({db_->DefaultColumnFamily()}));
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  if (max_subcompactions_ > 3) {
+    // RocksDB might not generate the exact number of sub compactions.
+    // Here we validate that at least subcompaction happened.
+    ASSERT_GT(listener->sub_compaction_finished_.load(), 2);
+  }
+
+  // We expect that all the files were compacted to L1
+  ASSERT_EQ(NumTableFilesAtLevel(0, 0), 0);
+  ASSERT_GT(NumTableFilesAtLevel(1, 0), 1);
+
+  for (size_t i = 0; i < ranges.size(); i++) {
+    for (int32_t j = ranges[i].first; j <= ranges[i].second; j++) {
+      ASSERT_EQ(Get(Key(j)), values[j]);
+    }
   }
 }
 
@@ -4755,6 +4739,98 @@ TEST_F(DBCompactionTest, CompactionStatsTest) {
   VerifyCompactionStats(*cfd, *collector);
 }
 
+TEST_F(DBCompactionTest, SubcompactionEvent) {
+  class SubCompactionEventListener : public EventListener {
+   public:
+    void OnCompactionBegin(DB* /*db*/, const CompactionJobInfo& ci) override {
+      InstrumentedMutexLock l(&mutex_);
+      ASSERT_EQ(running_compactions_.find(ci.job_id),
+                running_compactions_.end());
+      running_compactions_.emplace(ci.job_id, std::unordered_set<int>());
+    }
+
+    void OnCompactionCompleted(DB* /*db*/,
+                               const CompactionJobInfo& ci) override {
+      InstrumentedMutexLock l(&mutex_);
+      auto it = running_compactions_.find(ci.job_id);
+      ASSERT_NE(it, running_compactions_.end());
+      ASSERT_EQ(it->second.size(), 0);
+      running_compactions_.erase(it);
+    }
+
+    void OnSubcompactionBegin(const SubcompactionJobInfo& si) override {
+      InstrumentedMutexLock l(&mutex_);
+      auto it = running_compactions_.find(si.job_id);
+      ASSERT_NE(it, running_compactions_.end());
+      auto r = it->second.insert(si.subcompaction_job_id);
+      ASSERT_TRUE(r.second);  // each subcompaction_job_id should be different
+      total_subcompaction_cnt_++;
+    }
+
+    void OnSubcompactionCompleted(const SubcompactionJobInfo& si) override {
+      InstrumentedMutexLock l(&mutex_);
+      auto it = running_compactions_.find(si.job_id);
+      ASSERT_NE(it, running_compactions_.end());
+      auto r = it->second.erase(si.subcompaction_job_id);
+      ASSERT_EQ(r, 1);
+    }
+
+    size_t GetRunningCompactionCount() {
+      InstrumentedMutexLock l(&mutex_);
+      return running_compactions_.size();
+    }
+
+    size_t GetTotalSubcompactionCount() {
+      InstrumentedMutexLock l(&mutex_);
+      return total_subcompaction_cnt_;
+    }
+
+   private:
+    InstrumentedMutex mutex_;
+    std::unordered_map<int, std::unordered_set<int>> running_compactions_;
+    size_t total_subcompaction_cnt_ = 0;
+  };
+
+  Options options = CurrentOptions();
+  options.target_file_size_base = 1024;
+  options.level0_file_num_compaction_trigger = 10;
+  auto* listener = new SubCompactionEventListener();
+  options.listeners.emplace_back(listener);
+
+  DestroyAndReopen(options);
+
+  // generate 4 files @ L2
+  for (int i = 0; i < 4; i++) {
+    for (int j = 0; j < 10; j++) {
+      int key_id = i * 10 + j;
+      ASSERT_OK(Put(Key(key_id), "value" + ToString(key_id)));
+    }
+    ASSERT_OK(Flush());
+  }
+  MoveFilesToLevel(2);
+
+  // generate 2 files @ L1 which overlaps with L2 files
+  for (int i = 0; i < 2; i++) {
+    for (int j = 0; j < 10; j++) {
+      int key_id = i * 20 + j * 2;
+      ASSERT_OK(Put(Key(key_id), "value" + ToString(key_id)));
+    }
+    ASSERT_OK(Flush());
+  }
+  MoveFilesToLevel(1);
+  ASSERT_EQ(FilesPerLevel(), "0,2,4");
+
+  CompactRangeOptions comp_opts;
+  comp_opts.max_subcompactions = 4;
+  Status s = dbfull()->CompactRange(comp_opts, nullptr, nullptr);
+  ASSERT_OK(s);
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  // make sure there's no running compaction
+  ASSERT_EQ(listener->GetRunningCompactionCount(), 0);
+  // and sub compaction is triggered
+  ASSERT_GT(listener->GetTotalSubcompactionCount(), 0);
+}
+
 TEST_F(DBCompactionTest, CompactFilesOutputRangeConflict) {
   // LSM setup:
   // L1:      [ba bz]
@@ -6148,7 +6224,7 @@ TEST_F(DBCompactionTest, CompactionWithBlob) {
   const auto& blob_files = storage_info->GetBlobFiles();
   ASSERT_EQ(blob_files.size(), 1);
 
-  const auto& blob_file = blob_files.begin()->second;
+  const auto& blob_file = blob_files.front();
   ASSERT_NE(blob_file, nullptr);
 
   ASSERT_EQ(table_file->smallest.user_key(), first_key);
@@ -6408,20 +6484,29 @@ TEST_F(DBCompactionTest, CompactionWithBlobGCError_CorruptIndex) {
   ASSERT_OK(Put(third_key, third_value));
 
   constexpr char fourth_key[] = "fourth_key";
-  constexpr char corrupt_blob_index[] = "foobar";
-
-  WriteBatch batch;
-  ASSERT_OK(WriteBatchInternal::PutBlobIndex(&batch, 0, fourth_key,
-                                             corrupt_blob_index));
-  ASSERT_OK(db_->Write(WriteOptions(), &batch));
+  constexpr char fourth_value[] = "fourth_value";
+  ASSERT_OK(Put(fourth_key, fourth_value));
 
   ASSERT_OK(Flush());
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "CompactionIterator::GarbageCollectBlobIfNeeded::TamperWithBlobIndex",
+      [](void* arg) {
+        Slice* const blob_index = static_cast<Slice*>(arg);
+        assert(blob_index);
+        assert(!blob_index->empty());
+        blob_index->remove_prefix(1);
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
 
   constexpr Slice* begin = nullptr;
   constexpr Slice* end = nullptr;
 
   ASSERT_TRUE(
       db_->CompactRange(CompactRangeOptions(), begin, end).IsCorruption());
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
 }
 
 TEST_F(DBCompactionTest, CompactionWithBlobGCError_InlinedTTLIndex) {

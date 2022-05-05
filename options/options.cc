@@ -277,8 +277,6 @@ void ColumnFamilyOptions::Dump(Logger* log) const {
     ROCKS_LOG_HEADER(log,
                      "  Options.hard_pending_compaction_bytes_limit: %" PRIu64,
                      hard_pending_compaction_bytes_limit);
-    ROCKS_LOG_HEADER(log, "      Options.rate_limit_delay_max_milliseconds: %u",
-                     rate_limit_delay_max_milliseconds);
     ROCKS_LOG_HEADER(log, "               Options.disable_auto_compactions: %d",
                      disable_auto_compactions);
 
@@ -662,13 +660,13 @@ ReadOptions::ReadOptions()
       pin_data(false),
       background_purge_on_iterator_cleanup(false),
       ignore_range_deletions(false),
-      iter_start_seqnum(0),
       timestamp(nullptr),
       iter_start_ts(nullptr),
       deadline(std::chrono::microseconds::zero()),
       io_timeout(std::chrono::microseconds::zero()),
       value_size_soft_limit(std::numeric_limits<uint64_t>::max()),
-      adaptive_readahead(false) {}
+      adaptive_readahead(false),
+      async_io(false) {}
 
 ReadOptions::ReadOptions(bool cksum, bool cache)
     : snapshot(nullptr),
@@ -687,12 +685,12 @@ ReadOptions::ReadOptions(bool cksum, bool cache)
       pin_data(false),
       background_purge_on_iterator_cleanup(false),
       ignore_range_deletions(false),
-      iter_start_seqnum(0),
       timestamp(nullptr),
       iter_start_ts(nullptr),
       deadline(std::chrono::microseconds::zero()),
       io_timeout(std::chrono::microseconds::zero()),
       value_size_soft_limit(std::numeric_limits<uint64_t>::max()),
-      adaptive_readahead(false) {}
+      adaptive_readahead(false),
+      async_io(false) {}
 
 }  // namespace ROCKSDB_NAMESPACE

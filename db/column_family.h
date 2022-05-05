@@ -9,10 +9,10 @@
 
 #pragma once
 
-#include <unordered_map>
-#include <string>
-#include <vector>
 #include <atomic>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
 #include "db/memtable_list.h"
 #include "db/table_cache.h"
@@ -25,6 +25,7 @@
 #include "rocksdb/env.h"
 #include "rocksdb/options.h"
 #include "trace_replay/block_cache_tracer.h"
+#include "util/hash_containers.h"
 #include "util/thread_local.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -413,7 +414,8 @@ class ColumnFamilyData {
                            const CompactRangeOptions& compact_range_options,
                            const InternalKey* begin, const InternalKey* end,
                            InternalKey** compaction_end, bool* manual_conflict,
-                           uint64_t max_file_num_to_ignore);
+                           uint64_t max_file_num_to_ignore,
+                           const std::string& trim_ts);
 
   CompactionPicker* compaction_picker() { return compaction_picker_.get(); }
   // thread-safe
@@ -704,8 +706,8 @@ class ColumnFamilySet {
   // * when reading, at least one condition needs to be satisfied:
   // 1. DB mutex locked
   // 2. accessed from a single-threaded write thread
-  std::unordered_map<std::string, uint32_t> column_families_;
-  std::unordered_map<uint32_t, ColumnFamilyData*> column_family_data_;
+  UnorderedMap<std::string, uint32_t> column_families_;
+  UnorderedMap<uint32_t, ColumnFamilyData*> column_family_data_;
 
   uint32_t max_column_family_;
   const FileOptions file_options_;

@@ -11,7 +11,9 @@
 #include <algorithm>
 #include <array>
 #include <limits>
+#include <memory>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -50,6 +52,7 @@
 #include "table/block_based/block_prefix_index.h"
 #include "table/block_based/block_type.h"
 #include "table/block_based/filter_block.h"
+#include "table/block_based/filter_policy_internal.h"
 #include "table/block_based/full_filter_block.h"
 #include "table/block_based/hash_index_reader.h"
 #include "table/block_based/partitioned_filter_block.h"
@@ -119,12 +122,11 @@ Status ReadBlockFromFile(
 void ReleaseCachedEntry(void* arg, void* h) {
   Cache* cache = reinterpret_cast<Cache*>(arg);
   Cache::Handle* handle = reinterpret_cast<Cache::Handle*>(h);
-  cache->Release(handle, false /* force_erase */);
+  cache->Release(handle, false /* erase_if_last_ref */);
 }
 
-// For hash based index, return true if prefix_extractor and
-// prefix_extractor_block mismatch, false otherwise. This flag will be used
-// as total_order_seek via NewIndexIterator
+// For hash based index, return false if table_properties->prefix_extractor_name
+// and prefix_extractor both exist and match, otherwise true.
 inline bool PrefixExtractorChangedHelper(
     const TableProperties* table_properties,
     const SliceTransform* prefix_extractor) {
@@ -551,6 +553,7 @@ Status BlockBasedTable::Open(
     const InternalKeyComparator& internal_comparator,
     std::unique_ptr<RandomAccessFileReader>&& file, uint64_t file_size,
     std::unique_ptr<TableReader>* table_reader,
+    std::shared_ptr<CacheReservationManager> table_reader_cache_res_mgr,
     const std::shared_ptr<const SliceTransform>& prefix_extractor,
     const bool prefetch_index_and_filter_in_cache, const bool skip_filters,
     const int level, const bool immortal_table,
@@ -616,19 +619,19 @@ Status BlockBasedTable::Open(
         "version of RocksDB?");
   }
 
-  // We've successfully read the footer. We are ready to serve requests.
-  // Better not mutate rep_ after the creation. eg. internal_prefix_transform
-  // raw pointer will be used to create HashIndexReader, whose reset may
-  // access a dangling pointer.
   BlockCacheLookupContext lookup_context{TableReaderCaller::kPrefetch};
   Rep* rep = new BlockBasedTable::Rep(ioptions, env_options, table_options,
                                       internal_comparator, skip_filters,
                                       file_size, level, immortal_table);
   rep->file = std::move(file);
   rep->footer = footer;
-  rep->hash_index_allow_collision = table_options.hash_index_allow_collision;
+  // We've successfully read the footer. We are ready to serve requests.
+  // Better not mutate rep_ after the creation. eg. internal_prefix_transform
+  // raw pointer will be used to create HashIndexReader, whose reset may
+  // access a dangling pointer.
   // We need to wrap data with internal_prefix_transform to make sure it can
   // handle prefix correctly.
+  // FIXME: is changed prefix_extractor handled anywhere for hash index?
   if (prefix_extractor != nullptr) {
     rep->internal_prefix_transform.reset(
         new InternalKeySliceTransform(prefix_extractor.get()));
@@ -714,10 +717,22 @@ Status BlockBasedTable::Open(
       tail_prefetch_stats->RecordEffectiveSize(
           static_cast<size_t>(file_size) - prefetch_buffer->min_offset_read());
     }
-
-    *table_reader = std::move(new_table);
   }
 
+  if (s.ok() && table_reader_cache_res_mgr) {
+    std::size_t mem_usage = new_table->ApproximateMemoryUsage();
+    s = table_reader_cache_res_mgr->MakeCacheReservation(
+        mem_usage, &(rep->table_reader_cache_res_handle));
+    if (s.IsIncomplete()) {
+      s = Status::MemoryLimit(
+          "Can't allocate BlockBasedTableReader due to memory limit based on "
+          "cache capacity for memory allocation");
+    }
+  }
+
+  if (s.ok()) {
+    *table_reader = std::move(new_table);
+  }
   return s;
 }
 
@@ -770,7 +785,9 @@ Status BlockBasedTable::PrefetchTail(
   IOOptions opts;
   Status s = file->PrepareIOOptions(ro, opts);
   if (s.ok()) {
-    s = (*prefetch_buffer)->Prefetch(opts, file, prefetch_off, prefetch_len);
+    s = (*prefetch_buffer)
+            ->Prefetch(opts, file, prefetch_off, prefetch_len,
+                       ro.rate_limiter_priority);
   }
   return s;
 }
@@ -896,33 +913,59 @@ Status BlockBasedTable::PrefetchIndexAndFilterBlocks(
     const BlockBasedTableOptions& table_options, const int level,
     size_t file_size, size_t max_file_size_for_l0_meta_pin,
     BlockCacheLookupContext* lookup_context) {
-  Status s;
-
   // Find filter handle and filter type
   if (rep_->filter_policy) {
-    for (auto filter_type :
-         {Rep::FilterType::kFullFilter, Rep::FilterType::kPartitionedFilter,
-          Rep::FilterType::kBlockFilter}) {
-      std::string prefix;
-      switch (filter_type) {
-        case Rep::FilterType::kFullFilter:
-          prefix = kFullFilterBlockPrefix;
+    auto name = rep_->filter_policy->CompatibilityName();
+    bool builtin_compatible =
+        strcmp(name, BuiltinFilterPolicy::kCompatibilityName()) == 0;
+
+    for (const auto& [filter_type, prefix] :
+         {std::make_pair(Rep::FilterType::kFullFilter, kFullFilterBlockPrefix),
+          std::make_pair(Rep::FilterType::kPartitionedFilter,
+                         kPartitionedFilterBlockPrefix),
+          std::make_pair(Rep::FilterType::kBlockFilter, kFilterBlockPrefix)}) {
+      if (builtin_compatible) {
+        // This code is only here to deal with a hiccup in early 7.0.x where
+        // there was an unintentional name change in the SST files metadata.
+        // It should be OK to remove this in the future (late 2022) and just
+        // have the 'else' code.
+        // NOTE: the test:: names below are likely not needed but included
+        // out of caution
+        static const std::unordered_set<std::string> kBuiltinNameAndAliases = {
+            BuiltinFilterPolicy::kCompatibilityName(),
+            test::LegacyBloomFilterPolicy::kClassName(),
+            test::FastLocalBloomFilterPolicy::kClassName(),
+            test::Standard128RibbonFilterPolicy::kClassName(),
+            DeprecatedBlockBasedBloomFilterPolicy::kClassName(),
+            BloomFilterPolicy::kClassName(),
+            RibbonFilterPolicy::kClassName(),
+        };
+
+        // For efficiency, do a prefix seek and see if the first match is
+        // good.
+        meta_iter->Seek(prefix);
+        if (meta_iter->status().ok() && meta_iter->Valid()) {
+          Slice key = meta_iter->key();
+          if (key.starts_with(prefix)) {
+            key.remove_prefix(prefix.size());
+            if (kBuiltinNameAndAliases.find(key.ToString()) !=
+                kBuiltinNameAndAliases.end()) {
+              Slice v = meta_iter->value();
+              Status s = rep_->filter_handle.DecodeFrom(&v);
+              if (s.ok()) {
+                rep_->filter_type = filter_type;
+                break;
+              }
+            }
+          }
+        }
+      } else {
+        std::string filter_block_key = prefix + name;
+        if (FindMetaBlock(meta_iter, filter_block_key, &rep_->filter_handle)
+                .ok()) {
+          rep_->filter_type = filter_type;
           break;
-        case Rep::FilterType::kPartitionedFilter:
-          prefix = kPartitionedFilterBlockPrefix;
-          break;
-        case Rep::FilterType::kBlockFilter:
-          prefix = kFilterBlockPrefix;
-          break;
-        default:
-          assert(0);
-      }
-      std::string filter_block_key = prefix;
-      filter_block_key.append(rep_->filter_policy->Name());
-      if (FindMetaBlock(meta_iter, filter_block_key, &rep_->filter_handle)
-              .ok()) {
-        rep_->filter_type = filter_type;
-        break;
+        }
       }
     }
   }
@@ -931,8 +974,8 @@ Status BlockBasedTable::PrefetchIndexAndFilterBlocks(
          rep_->index_type == BlockBasedTableOptions::kTwoLevelIndexSearch);
 
   // Find compression dictionary handle
-  s = FindOptionalMetaBlock(meta_iter, kCompressionDictBlockName,
-                            &rep_->compression_dict_handle);
+  Status s = FindOptionalMetaBlock(meta_iter, kCompressionDictBlockName,
+                                   &rep_->compression_dict_handle);
   if (!s.ok()) {
     return s;
   }
@@ -1079,6 +1122,11 @@ std::shared_ptr<const TableProperties> BlockBasedTable::GetTableProperties()
 
 size_t BlockBasedTable::ApproximateMemoryUsage() const {
   size_t usage = 0;
+  if (rep_) {
+    usage += rep_->ApproximateMemoryUsage();
+  } else {
+    return usage;
+  }
   if (rep_->filter) {
     usage += rep_->filter->ApproximateMemoryUsage();
   }
@@ -1087,6 +1135,9 @@ size_t BlockBasedTable::ApproximateMemoryUsage() const {
   }
   if (rep_->uncompression_dict_reader) {
     usage += rep_->uncompression_dict_reader->ApproximateMemoryUsage();
+  }
+  if (rep_->table_properties) {
+    usage += rep_->table_properties->ApproximateMemoryUsage();
   }
   return usage;
 }
@@ -1472,9 +1523,9 @@ Status BlockBasedTable::MaybeReadBlockAndLoadToCache(
           // Update the block details so that PrefetchBuffer can use the read
           // pattern to determine if reads are sequential or not for
           // prefetching. It should also take in account blocks read from cache.
-          prefetch_buffer->UpdateReadPattern(handle.offset(),
-                                             BlockSizeWithTrailer(handle),
-                                             ro.adaptive_readahead);
+          prefetch_buffer->UpdateReadPattern(
+              handle.offset(), BlockSizeWithTrailer(handle),
+              ro.adaptive_readahead /*decrease_readahead_size*/);
         }
       }
     }
@@ -1732,8 +1783,8 @@ void BlockBasedTable::RetrieveMultipleBlocks(
     IOOptions opts;
     IOStatus s = file->PrepareIOOptions(options, opts);
     if (s.ok()) {
-      s = file->MultiRead(opts, &read_reqs[0], read_reqs.size(),
-                          &direct_io_buf);
+      s = file->MultiRead(opts, &read_reqs[0], read_reqs.size(), &direct_io_buf,
+                          options.rate_limiter_priority);
     }
     if (!s.ok()) {
       // Discard all the results in this batch if there is any time out
@@ -2010,7 +2061,7 @@ template Status BlockBasedTable::RetrieveBlock<UncompressionDict>(
 
 BlockBasedTable::PartitionedIndexIteratorState::PartitionedIndexIteratorState(
     const BlockBasedTable* table,
-    std::unordered_map<uint64_t, CachableEntry<Block>>* block_map)
+    UnorderedMap<uint64_t, CachableEntry<Block>>* block_map)
     : table_(table), block_map_(block_map) {}
 
 InternalIteratorBase<IndexValue>*
@@ -2217,8 +2268,7 @@ FragmentedRangeTombstoneIterator* BlockBasedTable::NewRangeTombstoneIterator(
 }
 
 bool BlockBasedTable::FullFilterKeyMayMatch(
-    const ReadOptions& read_options, FilterBlockReader* filter,
-    const Slice& internal_key, const bool no_io,
+    FilterBlockReader* filter, const Slice& internal_key, const bool no_io,
     const SliceTransform* prefix_extractor, GetContext* get_context,
     BlockCacheLookupContext* lookup_context) const {
   if (filter == nullptr || filter->IsBlockBased()) {
@@ -2233,13 +2283,14 @@ bool BlockBasedTable::FullFilterKeyMayMatch(
     may_match =
         filter->KeyMayMatch(user_key_without_ts, prefix_extractor, kNotValid,
                             no_io, const_ikey_ptr, get_context, lookup_context);
-  } else if (!read_options.total_order_seek &&
-             !PrefixExtractorChanged(prefix_extractor) &&
+  } else if (!PrefixExtractorChanged(prefix_extractor) &&
              prefix_extractor->InDomain(user_key_without_ts) &&
              !filter->PrefixMayMatch(
                  prefix_extractor->Transform(user_key_without_ts),
                  prefix_extractor, kNotValid, no_io, const_ikey_ptr,
                  get_context, lookup_context)) {
+    // FIXME ^^^: there should be no reason for Get() to depend on current
+    // prefix_extractor at all. It should always use table_prefix_extractor.
     may_match = false;
   }
   if (may_match) {
@@ -2250,8 +2301,7 @@ bool BlockBasedTable::FullFilterKeyMayMatch(
 }
 
 void BlockBasedTable::FullFilterKeysMayMatch(
-    const ReadOptions& read_options, FilterBlockReader* filter,
-    MultiGetRange* range, const bool no_io,
+    FilterBlockReader* filter, MultiGetRange* range, const bool no_io,
     const SliceTransform* prefix_extractor,
     BlockCacheLookupContext* lookup_context) const {
   if (filter == nullptr || filter->IsBlockBased()) {
@@ -2274,8 +2324,9 @@ void BlockBasedTable::FullFilterKeysMayMatch(
       PERF_COUNTER_BY_LEVEL_ADD(bloom_filter_useful, filtered_keys,
                                 rep_->level);
     }
-  } else if (!read_options.total_order_seek &&
-             !PrefixExtractorChanged(prefix_extractor)) {
+  } else if (!PrefixExtractorChanged(prefix_extractor)) {
+    // FIXME ^^^: there should be no reason for MultiGet() to depend on current
+    // prefix_extractor at all. It should always use table_prefix_extractor.
     filter->PrefixesMayMatch(range, prefix_extractor, kNotValid, false,
                              lookup_context);
     RecordTick(rep_->ioptions.stats, BLOOM_FILTER_PREFIX_CHECKED, before_keys);
@@ -2313,9 +2364,8 @@ Status BlockBasedTable::Get(const ReadOptions& read_options, const Slice& key,
         read_options.snapshot != nullptr;
   }
   TEST_SYNC_POINT("BlockBasedTable::Get:BeforeFilterMatch");
-  const bool may_match =
-      FullFilterKeyMayMatch(read_options, filter, key, no_io, prefix_extractor,
-                            get_context, &lookup_context);
+  const bool may_match = FullFilterKeyMayMatch(
+      filter, key, no_io, prefix_extractor, get_context, &lookup_context);
   TEST_SYNC_POINT("BlockBasedTable::Get:AfterFilterMatch");
   if (!may_match) {
     RecordTick(rep_->ioptions.stats, BLOOM_FILTER_USEFUL);
@@ -2501,8 +2551,8 @@ void BlockBasedTable::MultiGet(const ReadOptions& read_options,
   BlockCacheLookupContext lookup_context{
       TableReaderCaller::kUserMultiGet, tracing_mget_id,
       /*get_from_user_specified_snapshot=*/read_options.snapshot != nullptr};
-  FullFilterKeysMayMatch(read_options, filter, &sst_file_range, no_io,
-                         prefix_extractor, &lookup_context);
+  FullFilterKeysMayMatch(filter, &sst_file_range, no_io, prefix_extractor,
+                         &lookup_context);
 
   if (!sst_file_range.empty()) {
     IndexBlockIter iiter_on_stack;
@@ -2569,6 +2619,7 @@ void BlockBasedTable::MultiGet(const ReadOptions& read_options,
           uncompression_dict_status =
               rep_->uncompression_dict_reader->GetOrReadUncompressionDictionary(
                   nullptr /* prefetch_buffer */, no_io,
+                  read_options.verify_checksums,
                   sst_file_range.begin()->get_context, &lookup_context,
                   &uncompression_dict);
           uncompression_dict_inited = true;
@@ -2986,7 +3037,7 @@ Status BlockBasedTable::VerifyChecksumInBlocks(
     BlockHandle handle = index_iter->value().handle;
     BlockContents contents;
     BlockFetcher block_fetcher(
-        rep_->file.get(), &prefetch_buffer, rep_->footer, ReadOptions(), handle,
+        rep_->file.get(), &prefetch_buffer, rep_->footer, read_options, handle,
         &contents, rep_->ioptions, false /* decompress */,
         false /*maybe_compressed*/, BlockType::kData,
         UncompressionDict::GetEmptyDict(), rep_->persistent_cache_options);
@@ -3115,12 +3166,6 @@ Status BlockBasedTable::CreateIndexReader(
     InternalIterator* meta_iter, bool use_cache, bool prefetch, bool pin,
     BlockCacheLookupContext* lookup_context,
     std::unique_ptr<IndexReader>* index_reader) {
-  // kHashSearch requires non-empty prefix_extractor but bypass checking
-  // prefix_extractor here since we have no access to MutableCFOptions.
-  // Add need_upper_bound_check flag in  BlockBasedTable::NewIndexIterator.
-  // If prefix_extractor does not match prefix_extractor_name from table
-  // properties, turn off Hash Index by setting total_order_seek to true
-
   switch (rep_->index_type) {
     case BlockBasedTableOptions::kTwoLevelIndexSearch: {
       return PartitionIndexReader::Create(this, ro, prefetch_buffer, use_cache,
@@ -3138,6 +3183,7 @@ Status BlockBasedTable::CreateIndexReader(
       std::unique_ptr<Block> metaindex_guard;
       std::unique_ptr<InternalIterator> metaindex_iter_guard;
       bool should_fallback = false;
+      // FIXME: is changed prefix_extractor handled anywhere for hash index?
       if (rep_->internal_prefix_transform.get() == nullptr) {
         ROCKS_LOG_WARN(rep_->ioptions.logger,
                        "No prefix extractor passed in. Fall back to binary"
@@ -3419,6 +3465,7 @@ Status BlockBasedTable::DumpTable(WritableFile* out_file) {
     CachableEntry<UncompressionDict> uncompression_dict;
     s = rep_->uncompression_dict_reader->GetOrReadUncompressionDictionary(
         nullptr /* prefetch_buffer */, false /* no_io */,
+        false, /* verify_checksums */
         nullptr /* get_context */, nullptr /* lookup_context */,
         &uncompression_dict);
     if (!s.ok()) {

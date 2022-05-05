@@ -21,11 +21,28 @@ namespace ROCKSDB_NAMESPACE {
 // Convenience methods
 Status DBImpl::Put(const WriteOptions& o, ColumnFamilyHandle* column_family,
                    const Slice& key, const Slice& val) {
+  const Status s = FailIfCfHasTs(column_family);
+  if (!s.ok()) {
+    return s;
+  }
   return DB::Put(o, column_family, key, val);
+}
+
+Status DBImpl::Put(const WriteOptions& o, ColumnFamilyHandle* column_family,
+                   const Slice& key, const Slice& ts, const Slice& val) {
+  const Status s = FailIfTsSizesMismatch(column_family, ts);
+  if (!s.ok()) {
+    return s;
+  }
+  return DB::Put(o, column_family, key, ts, val);
 }
 
 Status DBImpl::Merge(const WriteOptions& o, ColumnFamilyHandle* column_family,
                      const Slice& key, const Slice& val) {
+  const Status s = FailIfCfHasTs(column_family);
+  if (!s.ok()) {
+    return s;
+  }
   auto cfh = static_cast_with_check<ColumnFamilyHandleImpl>(column_family);
   if (!cfh->cfd()->ioptions()->merge_operator) {
     return Status::NotSupported("Provide a merge_operator when opening DB");
@@ -36,13 +53,51 @@ Status DBImpl::Merge(const WriteOptions& o, ColumnFamilyHandle* column_family,
 
 Status DBImpl::Delete(const WriteOptions& write_options,
                       ColumnFamilyHandle* column_family, const Slice& key) {
+  const Status s = FailIfCfHasTs(column_family);
+  if (!s.ok()) {
+    return s;
+  }
   return DB::Delete(write_options, column_family, key);
+}
+
+Status DBImpl::Delete(const WriteOptions& write_options,
+                      ColumnFamilyHandle* column_family, const Slice& key,
+                      const Slice& ts) {
+  const Status s = FailIfTsSizesMismatch(column_family, ts);
+  if (!s.ok()) {
+    return s;
+  }
+  return DB::Delete(write_options, column_family, key, ts);
 }
 
 Status DBImpl::SingleDelete(const WriteOptions& write_options,
                             ColumnFamilyHandle* column_family,
                             const Slice& key) {
+  const Status s = FailIfCfHasTs(column_family);
+  if (!s.ok()) {
+    return s;
+  }
   return DB::SingleDelete(write_options, column_family, key);
+}
+
+Status DBImpl::SingleDelete(const WriteOptions& write_options,
+                            ColumnFamilyHandle* column_family, const Slice& key,
+                            const Slice& ts) {
+  const Status s = FailIfTsSizesMismatch(column_family, ts);
+  if (!s.ok()) {
+    return s;
+  }
+  return DB::SingleDelete(write_options, column_family, key, ts);
+}
+
+Status DBImpl::DeleteRange(const WriteOptions& write_options,
+                           ColumnFamilyHandle* column_family,
+                           const Slice& begin_key, const Slice& end_key) {
+  const Status s = FailIfCfHasTs(column_family);
+  if (!s.ok()) {
+    return s;
+  }
+  return DB::DeleteRange(write_options, column_family, begin_key, end_key);
 }
 
 void DBImpl::SetRecoverableStatePreReleaseCallback(
@@ -51,7 +106,8 @@ void DBImpl::SetRecoverableStatePreReleaseCallback(
 }
 
 Status DBImpl::Write(const WriteOptions& write_options, WriteBatch* my_batch) {
-  return WriteImpl(write_options, my_batch, nullptr, nullptr);
+  return WriteImpl(write_options, my_batch, /*callback=*/nullptr,
+                   /*log_used=*/nullptr);
 }
 
 #ifndef ROCKSDB_LITE
@@ -73,7 +129,32 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
                          PreReleaseCallback* pre_release_callback) {
   assert(!seq_per_batch_ || batch_cnt != 0);
   if (my_batch == nullptr) {
-    return Status::Corruption("Batch is nullptr!");
+    return Status::InvalidArgument("Batch is nullptr!");
+  } else if (!disable_memtable &&
+             WriteBatchInternal::TimestampsUpdateNeeded(*my_batch)) {
+    // If writing to memtable, then we require the caller to set/update the
+    // timestamps for the keys in the write batch.
+    // Otherwise, it means we are just writing to the WAL, and we allow
+    // timestamps unset for the keys in the write batch. This can happen if we
+    // use TransactionDB with write-committed policy, and we currently do not
+    // support user-defined timestamp with other policies.
+    // In the prepare phase, a transaction can write the batch to the WAL
+    // without inserting to memtable. The keys in the batch do not have to be
+    // assigned timestamps because they will be used only during recovery if
+    // there is a commit marker which includes their commit timestamp.
+    return Status::InvalidArgument("write batch must have timestamp(s) set");
+  } else if (write_options.rate_limiter_priority != Env::IO_TOTAL &&
+             write_options.rate_limiter_priority != Env::IO_USER) {
+    return Status::InvalidArgument(
+        "WriteOptions::rate_limiter_priority only allows "
+        "Env::IO_TOTAL and Env::IO_USER due to implementation constraints");
+  } else if (write_options.rate_limiter_priority != Env::IO_TOTAL &&
+             (write_options.disableWAL || manual_wal_flush_)) {
+    return Status::InvalidArgument(
+        "WriteOptions::rate_limiter_priority currently only supports "
+        "rate-limiting automatic WAL flush, which requires "
+        "`WriteOptions::disableWAL` and "
+        "`DBOptions::manual_wal_flush` both set to false");
   }
   // TODO: this use of operator bool on `tracer_` can avoid unnecessary lock
   // grabs but does not seem thread-safe.
@@ -283,6 +364,7 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
     size_t total_byte_size = 0;
     size_t pre_release_callback_cnt = 0;
     for (auto* writer : write_group) {
+      assert(writer);
       if (writer->CheckCallback(this)) {
         valid_batches += writer->batch_cnt;
         if (writer->ShouldWriteToMemtable()) {
@@ -487,7 +569,8 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
   WriteContext write_context;
 
   WriteThread::Writer w(write_options, my_batch, callback, log_ref,
-                        disable_memtable);
+                        disable_memtable, /*_batch_cnt=*/0,
+                        /*_pre_release_callback=*/nullptr);
   write_thread_.JoinBatchGroup(&w);
   TEST_SYNC_POINT("DBImplWrite::PipelinedWriteImpl:AfterJoinBatchGroup");
   if (w.state == WriteThread::STATE_GROUP_LEADER) {
@@ -526,7 +609,8 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
         }
       }
       SequenceNumber next_sequence = current_sequence;
-      for (auto writer : wal_write_group) {
+      for (auto* writer : wal_write_group) {
+        assert(writer);
         if (writer->CheckCallback(this)) {
           if (writer->ShouldWriteToMemtable()) {
             writer->sequence = next_sequence;
@@ -764,6 +848,7 @@ Status DBImpl::WriteImplWALOnly(
   size_t pre_release_callback_cnt = 0;
   size_t total_byte_size = 0;
   for (auto* writer : write_group) {
+    assert(writer);
     if (writer->CheckCallback(this)) {
       total_byte_size = WriteBatchInternal::AppendedByteSize(
           total_byte_size, WriteBatchInternal::ByteSize(writer->batch));
@@ -1086,6 +1171,7 @@ WriteBatch* DBImpl::MergeBatch(const WriteThread::WriteGroup& write_group,
 IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
                             log::Writer* log_writer, uint64_t* log_used,
                             uint64_t* log_size,
+                            Env::IOPriority rate_limiter_priority,
                             bool with_db_mutex, bool with_log_mutex) {
   assert(log_size != nullptr);
 
@@ -1110,7 +1196,7 @@ IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
   if (UNLIKELY(needs_locking)) {
     log_write_mutex_.Lock();
   }
-  IOStatus io_s = log_writer->AddRecord(log_entry);
+  IOStatus io_s = log_writer->AddRecord(log_entry, rate_limiter_priority);
 
   if (UNLIKELY(needs_locking)) {
     log_write_mutex_.Unlock();
@@ -1152,7 +1238,8 @@ IOStatus DBImpl::WriteToWAL(const WriteThread::WriteGroup& write_group,
   WriteBatchInternal::SetSequence(merged_batch, sequence);
 
   uint64_t log_size;
-  io_s = WriteToWAL(*merged_batch, log_writer, log_used, &log_size);
+  io_s = WriteToWAL(*merged_batch, log_writer, log_used, &log_size,
+                    write_group.leader->rate_limiter_priority);
   if (to_be_cached_state) {
     cached_recoverable_state_ = *to_be_cached_state;
     cached_recoverable_state_empty_ = false;
@@ -1248,6 +1335,7 @@ IOStatus DBImpl::ConcurrentWriteToWAL(
   log::Writer* log_writer = logs_.back().writer;
   uint64_t log_size;
   io_s = WriteToWAL(*merged_batch, log_writer, log_used, &log_size,
+                    write_group.leader->rate_limiter_priority,
                     /*with_db_mutex=*/false, /*with_log_mutex=*/true);
   if (to_be_cached_state) {
     cached_recoverable_state_ = *to_be_cached_state;
@@ -1794,9 +1882,11 @@ void DBImpl::NotifyOnMemTableSealed(ColumnFamilyData* /*cfd*/,
     return;
   }
 
+  mutex_.Unlock();
   for (auto listener : immutable_db_options_.listeners) {
     listener->OnMemTableSealed(mem_table_info);
   }
+  mutex_.Lock();
 }
 #endif  // ROCKSDB_LITE
 
@@ -1997,11 +2087,9 @@ Status DBImpl::SwitchMemtable(ColumnFamilyData* cfd, WriteContext* context) {
                                      mutable_cf_options);
 
 #ifndef ROCKSDB_LITE
-  mutex_.Unlock();
   // Notify client that memtable is sealed, now that we have successfully
   // installed a new memtable
   NotifyOnMemTableSealed(cfd, memtable_info);
-  mutex_.Lock();
 #endif  // ROCKSDB_LITE
   // It is possible that we got here without checking the value of i_os, but
   // that is okay.  If we did, it most likely means that s was already an error.
@@ -2036,34 +2124,25 @@ size_t DBImpl::GetWalPreallocateBlockSize(uint64_t write_buffer_size) const {
 // can call if they wish
 Status DB::Put(const WriteOptions& opt, ColumnFamilyHandle* column_family,
                const Slice& key, const Slice& value) {
-  if (nullptr == opt.timestamp) {
-    // Pre-allocate size of write batch conservatively.
-    // 8 bytes are taken by header, 4 bytes for count, 1 byte for type,
-    // and we allocate 11 extra bytes for key length, as well as value length.
-    WriteBatch batch(key.size() + value.size() + 24);
-    Status s = batch.Put(column_family, key, value);
-    if (!s.ok()) {
-      return s;
-    }
-    return Write(opt, &batch);
+  // Pre-allocate size of write batch conservatively.
+  // 8 bytes are taken by header, 4 bytes for count, 1 byte for type,
+  // and we allocate 11 extra bytes for key length, as well as value length.
+  WriteBatch batch(key.size() + value.size() + 24);
+  Status s = batch.Put(column_family, key, value);
+  if (!s.ok()) {
+    return s;
   }
-  const Slice* ts = opt.timestamp;
-  assert(nullptr != ts);
-  size_t ts_sz = ts->size();
-  assert(column_family->GetComparator());
-  assert(ts_sz == column_family->GetComparator()->timestamp_size());
-  WriteBatch batch;
-  Status s;
-  if (key.data() + key.size() == ts->data()) {
-    Slice key_with_ts = Slice(key.data(), key.size() + ts_sz);
-    s = batch.Put(column_family, key_with_ts, value);
-  } else {
-    std::array<Slice, 2> key_with_ts_slices{{key, *ts}};
-    SliceParts key_with_ts(key_with_ts_slices.data(), 2);
-    std::array<Slice, 1> value_slices{{value}};
-    SliceParts values(value_slices.data(), 1);
-    s = batch.Put(column_family, key_with_ts, values);
-  }
+  return Write(opt, &batch);
+}
+
+Status DB::Put(const WriteOptions& opt, ColumnFamilyHandle* column_family,
+               const Slice& key, const Slice& ts, const Slice& value) {
+  ColumnFamilyHandle* default_cf = DefaultColumnFamily();
+  assert(default_cf);
+  const Comparator* const default_cf_ucmp = default_cf->GetComparator();
+  assert(default_cf_ucmp);
+  WriteBatch batch(0, 0, 0, default_cf_ucmp->timestamp_size());
+  Status s = batch.Put(column_family, key, ts, value);
   if (!s.ok()) {
     return s;
   }
@@ -2072,29 +2151,22 @@ Status DB::Put(const WriteOptions& opt, ColumnFamilyHandle* column_family,
 
 Status DB::Delete(const WriteOptions& opt, ColumnFamilyHandle* column_family,
                   const Slice& key) {
-  if (nullptr == opt.timestamp) {
-    WriteBatch batch;
-    Status s = batch.Delete(column_family, key);
-    if (!s.ok()) {
-      return s;
-    }
-    return Write(opt, &batch);
-  }
-  const Slice* ts = opt.timestamp;
-  assert(ts != nullptr);
-  size_t ts_sz = ts->size();
-  assert(column_family->GetComparator());
-  assert(ts_sz == column_family->GetComparator()->timestamp_size());
   WriteBatch batch;
-  Status s;
-  if (key.data() + key.size() == ts->data()) {
-    Slice key_with_ts = Slice(key.data(), key.size() + ts_sz);
-    s = batch.Delete(column_family, key_with_ts);
-  } else {
-    std::array<Slice, 2> key_with_ts_slices{{key, *ts}};
-    SliceParts key_with_ts(key_with_ts_slices.data(), 2);
-    s = batch.Delete(column_family, key_with_ts);
+  Status s = batch.Delete(column_family, key);
+  if (!s.ok()) {
+    return s;
   }
+  return Write(opt, &batch);
+}
+
+Status DB::Delete(const WriteOptions& opt, ColumnFamilyHandle* column_family,
+                  const Slice& key, const Slice& ts) {
+  ColumnFamilyHandle* default_cf = DefaultColumnFamily();
+  assert(default_cf);
+  const Comparator* const default_cf_ucmp = default_cf->GetComparator();
+  assert(default_cf_ucmp);
+  WriteBatch batch(0, 0, 0, default_cf_ucmp->timestamp_size());
+  Status s = batch.Delete(column_family, key, ts);
   if (!s.ok()) {
     return s;
   }
@@ -2103,36 +2175,27 @@ Status DB::Delete(const WriteOptions& opt, ColumnFamilyHandle* column_family,
 
 Status DB::SingleDelete(const WriteOptions& opt,
                         ColumnFamilyHandle* column_family, const Slice& key) {
-  Status s;
-  if (opt.timestamp == nullptr) {
-    WriteBatch batch;
-    s = batch.SingleDelete(column_family, key);
-    if (!s.ok()) {
-      return s;
-    }
-    s = Write(opt, &batch);
-    return s;
-  }
-
-  const Slice* ts = opt.timestamp;
-  assert(ts != nullptr);
-  size_t ts_sz = ts->size();
-  assert(column_family->GetComparator());
-  assert(ts_sz == column_family->GetComparator()->timestamp_size());
   WriteBatch batch;
-  if (key.data() + key.size() == ts->data()) {
-    Slice key_with_ts = Slice(key.data(), key.size() + ts_sz);
-    s = batch.SingleDelete(column_family, key_with_ts);
-  } else {
-    std::array<Slice, 2> key_with_ts_slices{{key, *ts}};
-    SliceParts key_with_ts(key_with_ts_slices.data(), 2);
-    s = batch.SingleDelete(column_family, key_with_ts);
-  }
+  Status s = batch.SingleDelete(column_family, key);
   if (!s.ok()) {
     return s;
   }
-  s = Write(opt, &batch);
-  return s;
+  return Write(opt, &batch);
+}
+
+Status DB::SingleDelete(const WriteOptions& opt,
+                        ColumnFamilyHandle* column_family, const Slice& key,
+                        const Slice& ts) {
+  ColumnFamilyHandle* default_cf = DefaultColumnFamily();
+  assert(default_cf);
+  const Comparator* const default_cf_ucmp = default_cf->GetComparator();
+  assert(default_cf_ucmp);
+  WriteBatch batch(0, 0, 0, default_cf_ucmp->timestamp_size());
+  Status s = batch.SingleDelete(column_family, key, ts);
+  if (!s.ok()) {
+    return s;
+  }
+  return Write(opt, &batch);
 }
 
 Status DB::DeleteRange(const WriteOptions& opt,
