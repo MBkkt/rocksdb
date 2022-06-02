@@ -170,8 +170,8 @@ else()
     #find_package(lz4 REQUIRED)
     add_definitions(-DLZ4)
     include_directories(${Lz4_INCLUDE_DIR})
-    list(APPEND THIRDPARTY_LIBS $<TARGET_LINKER_FILE_NAME:lz4_static>)
     #list(APPEND THIRDPARTY_LIBS lz4::lz4)
+    list(APPEND THIRDPARTY_LIBS lz4_static)
     # intentional deviation end
   endif()
 
@@ -1142,32 +1142,34 @@ if(NOT WIN32 OR ROCKSDB_INSTALL_ON_WINDOWS)
 
   install(DIRECTORY "${PROJECT_SOURCE_DIR}/cmake/modules" COMPONENT devel DESTINATION ${package_config_destination})
 
-  install(
-    TARGETS ${ROCKSDB_STATIC_LIB}
-    EXPORT RocksDBTargets
-    COMPONENT devel
-    ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
-    INCLUDES DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
-  )
+  # intentional deviation from RocksDB CMake
+  #install(
+  #  TARGETS ${ROCKSDB_STATIC_LIB}
+  #  EXPORT RocksDBTargets
+  #  COMPONENT devel
+  #  ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+  #  INCLUDES DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
+  #)
+  # intentional deviation end
 
-  if(ROCKSDB_BUILD_SHARED)
-    install(
-      TARGETS ${ROCKSDB_SHARED_LIB}
-      EXPORT RocksDBTargets
-      COMPONENT runtime
-      ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
-      RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
-      LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
-      INCLUDES DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
-    )
-  endif()
+  #if(ROCKSDB_BUILD_SHARED)
+  #  install(
+  #    TARGETS ${ROCKSDB_SHARED_LIB}
+  #    EXPORT RocksDBTargets
+  #    COMPONENT runtime
+  #    ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+  #    RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
+  #    LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+  #    INCLUDES DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
+  #  )
+  #endif()
 
-  install(
-    EXPORT RocksDBTargets
-    COMPONENT devel
-    DESTINATION ${package_config_destination}
-    NAMESPACE RocksDB::
-  )
+  #install(
+  #  EXPORT RocksDBTargets
+  #  COMPONENT devel
+  #  DESTINATION ${package_config_destination}
+  #  NAMESPACE RocksDB::
+  #)
 
   install(
     FILES
