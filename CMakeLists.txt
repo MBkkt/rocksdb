@@ -169,7 +169,7 @@ else()
     # intentional deviation from RocksDB CMake
     #find_package(lz4 REQUIRED)
     add_definitions(-DLZ4)
-    include_directories(${Lz4_INCLUDE_DIR})
+    include_directories(${LZ4_INCLUDE_DIR})
     #list(APPEND THIRDPARTY_LIBS lz4::lz4)
     list(APPEND THIRDPARTY_LIBS lz4_static)
     # intentional deviation end
