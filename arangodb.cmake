@@ -59,6 +59,3 @@ if (MSVC)
 endif ()
 set(USE_RTTI ON CACHE BOOL "enable RTTI")
 
-#target_link_libraries(rocksdb)
-# result
-#list(APPEND LINK_DIRECTORIES "${CMAKE_CURRENT_BINARY_DIR}/rocksdb/${ARANGO_ROCKSDB_VERSION}")
