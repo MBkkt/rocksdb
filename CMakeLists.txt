@@ -166,9 +166,13 @@ else()
   endif()
 
   if(WITH_LZ4)
-    find_package(lz4 REQUIRED)
+    # intentional deviation from RocksDB CMake
+    #find_package(lz4 REQUIRED)
     add_definitions(-DLZ4)
-    list(APPEND THIRDPARTY_LIBS lz4::lz4)
+    include_directories(${Lz4_INCLUDE_DIR})
+    list(APPEND THIRDPARTY_LIBS $<TARGET_LINKER_FILE_NAME:lz4_static>)
+    #list(APPEND THIRDPARTY_LIBS lz4::lz4)
+    # intentional deviation end
   endif()
 
   if(WITH_ZSTD)
